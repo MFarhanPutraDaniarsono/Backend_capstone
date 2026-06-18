@@ -1,524 +1,155 @@
+import os
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 from flask_cors import CORS
 
-import random
-import requests
-from datetime import datetime
-
-from flask_jwt_extended import (
-    JWTManager,
-    create_access_token,
-    jwt_required,
-    get_jwt_identity
-)
-
-app = Flask(__name__)
+    app = Flask(__name__)
 CORS(app)
 
 # =========================
-# CONFIG
+# CONFIG (Neon Database)
 # =========================
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///database.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://neondb_owner:npg_6ugBHKE1fiWz@ep-patient-cake-aokqq1ge.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-app.config['JWT_SECRET_KEY'] = 'secret123'
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
-jwt = JWTManager(app)
-
-FONNTE_TOKEN = 'AT6MUTqfshTFbRJeTNMg'
-
-def format_phone(phone):
-    phone = phone.replace('+', '').replace(' ', '')
-
-    if phone.startswith('0'):
-        phone = '62' + phone[1:]
-
-    return phone
 
 # =========================
-# JWT DEBUGGING
+# MODEL: ACCOUNTS & PROFILES (EMAIL BASED)
 # =========================
-
-@jwt.invalid_token_loader
-def invalid_token_callback(error):
-
-    print("\n====================")
-    print("JWT INVALID TOKEN")
-    print(error)
-    print("====================\n")
-
-    return jsonify({
-        "msg": error
-    }), 422
-
-
-@jwt.unauthorized_loader
-def missing_token_callback(error):
-
-    print("\n====================")
-    print("JWT MISSING TOKEN")
-    print(error)
-    print("====================\n")
-
-    return jsonify({
-        "msg": error
-    }), 401
-
-
-@jwt.expired_token_loader
-def expired_token_callback(jwt_header, jwt_payload):
-
-    print("\n====================")
-    print("JWT EXPIRED")
-    print(jwt_payload)
-    print("====================\n")
-
-    return jsonify({
-        "msg": "Token expired"
-    }), 401
-
-# =========================
-# MODEL USER
-# =========================
-class User(db.Model):
+class Account(db.Model):
+    __tablename__ = 'accounts'
     id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(150), unique=True, nullable=False)
+    password = db.Column(db.String(255), nullable=False)
+    is_verified = db.Column(db.Boolean, default=True) # Otomatis aktif tanpa OTP
+    
+    # Hubungan One-to-One ke Profile
+    profile = db.relationship('UserProfile', backref='account', uselist=False, cascade="all, delete-orphan")
 
+class UserProfile(db.Model):
+    __tablename__ = 'user_profiles'
+    id = db.Column(db.Integer, primary_key=True)
+    account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'), unique=True, nullable=False)
     owner_name = db.Column(db.String(100))
-
-    owner_phone = db.Column(
-        db.String(15),
-        unique=True,
-        nullable=False
-    )
-
     workshop_name = db.Column(db.String(100))
     workshop_phone = db.Column(db.String(15))
-
-    password = db.Column(
-        db.String(255),
-        nullable=False
-    )
-
-    is_verified = db.Column(
-        db.Boolean,
-        default=False
-    )
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
 # =========================
-# MODEL OTP
-# =========================
-class OTP(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-
-    phone = db.Column(
-        db.String(15),
-        nullable=False
-    )
-
-    otp_code = db.Column(
-        db.String(6),
-        nullable=False
-    )
-
-    created_at = db.Column(
-        db.DateTime,
-        default=datetime.utcnow
-    )
-
-    verified = db.Column(
-        db.Boolean,
-        default=False
-    )
-
-# =========================
-# REGISTER
+# ENDPOINT: REGISTER
 # =========================
 @app.route('/register', methods=['POST'])
 def register():
-
     data = request.get_json()
-
-    owner_name = data.get('owner_name')
-    owner_phone = data.get('owner_phone')
-
-    workshop_name = data.get('workshop_name')
-    workshop_phone = data.get('workshop_phone')
-
+    email = data.get('email', '').strip().lower()
     password = data.get('password')
+    
+    owner_name = data.get('owner_name', '')
+    workshop_name = data.get('workshop_name', '')
+    workshop_phone = data.get('workshop_phone', '')
 
-    if not owner_name or not owner_phone or not password:
-        return jsonify({
-            'message': 'Data tidak lengkap'
-        }), 400
+    if not email or not password:
+        return jsonify({'message': 'Email dan Password wajib diisi'}), 400
 
-    owner_phone = format_phone(owner_phone)
+    # Cek ketersediaan email
+    existing_account = Account.query.filter_by(email=email).first()
+    if existing_account:
+        return jsonify({'message': 'Email sudah terdaftar'}), 400
 
-    if workshop_phone:
-        workshop_phone = format_phone(workshop_phone)
+    hashed_pw = bcrypt.generate_password_hash(password).decode('utf-8')
 
-    user = User.query.filter_by(
-        owner_phone=owner_phone
-    ).first()
+    # 1. Simpan ke tabel Akun
+    new_account = Account(email=email, password=hashed_pw, is_verified=True)
+    db.session.add(new_account)
+    db.session.flush()  # Ambil ID account sebelum commit
 
-    if user:
-        return jsonify({
-            'message': 'Nomor sudah terdaftar'
-        }), 400
-
-    hashed_pw = bcrypt.generate_password_hash(
-        password
-    ).decode('utf-8')
-
-    new_user = User(
+    # 2. Simpan ke tabel Profil
+    new_profile = UserProfile(
+        account_id=new_account.id,
         owner_name=owner_name,
-        owner_phone=owner_phone,
         workshop_name=workshop_name,
-        workshop_phone=workshop_phone,
-        password=hashed_pw,
-        is_verified=False
+        workshop_phone=workshop_phone if workshop_phone else None
     )
-
-    db.session.add(new_user)
+    db.session.add(new_profile)
     db.session.commit()
-
-    otp = str(random.randint(100000, 999999))
-
-    otp_data = OTP(
-        phone=owner_phone,
-        otp_code=otp
-    )
-
-    db.session.add(otp_data)
-    db.session.commit()
-
-    print(f'\nOTP untuk {owner_phone}: {otp}\n')
-
-    try:
-        url = 'https://api.fonnte.com/send'
-
-        payload = {
-            'target': owner_phone,
-            'message': f'''
-Kode OTP Anda: {otp}
-
-Jangan berikan kode ini kepada siapa pun.
-Kode berlaku selama 5 menit.
-'''
-        }
-
-        headers = {
-            'Authorization': FONNTE_TOKEN 
-        }
-
-        response = requests.post(
-            url,
-            data=payload,
-            headers=headers
-        )
-
-        print(response.text)
-
-    except Exception as e:
-        print(f'Gagal mengirim WhatsApp: {e}')
 
     return jsonify({
-        'message': 'Registrasi berhasil',
-        'phone': owner_phone
+        'message': 'Registrasi berhasil, akun langsung aktif!',
+        'email': email
     }), 201
 
 # =========================
-# LOGIN PASSWORD
+# ENDPOINT: LOGIN (MANUAL EMAIL)
 # =========================
 @app.route('/login', methods=['POST'])
 def login():
-
     data = request.get_json()
-
-    phone = data.get('phone')
+    email = data.get('email', '').strip().lower()
     password = data.get('password')
 
-    if not phone or not password:
-        return jsonify({
-            'message': 'Data tidak lengkap'
-        }), 400
+    if not email or not password:
+        return jsonify({'message': 'Email dan password tidak boleh kosong'}), 400
 
-    phone = format_phone(phone)
+    account = Account.query.filter_by(email=email).first()
 
-    user = User.query.filter_by(
-        owner_phone=phone
-    ).first()
+    if not account:
+        return jsonify({'message': 'Email tidak ditemukan'}), 404
 
-    if not user:
-        return jsonify({
-            'message': 'User tidak ditemukan'
-        }), 404
+    if not bcrypt.check_password_hash(account.password, password):
+        return jsonify({'message': 'Password salah'}), 401
 
-    if not user.is_verified:
-        return jsonify({
-            'message': 'Nomor belum verifikasi OTP'
-        }), 403
-
-    if not bcrypt.check_password_hash(
-        user.password,
-        password
-    ):
-        return jsonify({
-            'message': 'Password salah'
-        }), 401
-
-    token = create_access_token(
-        identity=str(user.id)
-    )
+    # Mengembalikan data user secara langsung (Bypass JWT token)
+    profile_data = {}
+    if account.profile:
+        profile_data = {
+            'owner_name': account.profile.owner_name,
+            'workshop_name': account.profile.workshop_name,
+            'workshop_phone': account.profile.workshop_phone
+        }
 
     return jsonify({
         'message': 'Login berhasil',
-        'token': token,
         'user': {
-            'id': user.id,
-            'owner_name': user.owner_name,
-            'owner_phone': user.owner_phone,
-            'workshop_name': user.workshop_name,
-            'workshop_phone': user.workshop_phone
+            'id': account.id,
+            'email': account.email,
+            **profile_data
         }
     }), 200
 
 # =========================
-# SEND OTP WHATSAPP
+# ENDPOINT: PROFILE (MANUAL BY ID)
 # =========================
-@app.route('/send-otp', methods=['POST'])
-def send_otp():
+@app.route('/profile/<int:user_id>', methods=['GET'])
+def profile(user_id):
+    account = Account.query.get(user_id)
 
-    data = request.get_json()
+    if not account:
+        return jsonify({'message': 'User tidak ditemukan'}), 404
 
-    phone = data.get('phone')
-
-    if not phone:
-        return jsonify({
-            'message': 'Nomor wajib diisi'
-        }), 400
-
-    phone = format_phone(phone)
-
-    user = User.query.filter_by(
-        owner_phone=phone
-    ).first()
-
-    if not user:
-        return jsonify({
-            'message': 'User tidak ditemukan'
-        }), 404
-
-    otp = str(random.randint(100000, 999999))
-
-    otp_data = OTP(
-        phone=phone,
-        otp_code=otp
-    )
-
-    db.session.add(otp_data)
-    db.session.commit()
-
-    print(f'\nOTP untuk {phone}: {otp}\n')
-
-    try:
-        url = 'https://api.fonnte.com/send'
-
-        payload = {
-            'target': phone,
-            'message': f'''
-Kode OTP Anda: {otp}
-
-Jangan berikan kode ini kepada siapa pun.
-'''
+    profile_data = {}
+    if account.profile:
+        profile_data = {
+            'owner_name': account.profile.owner_name,
+            'workshop_name': account.profile.workshop_name,
+            'workshop_phone': account.profile.workshop_phone
         }
-
-        headers = {
-            'Authorization': FONNTE_TOKEN
-        }
-
-        response = requests.post(
-            url,
-            data=payload,
-            headers=headers
-        )
-
-        print(response.text)
-
-    except Exception as e:
-        print(f'Gagal mengirim WhatsApp: {e}')
-
-    return jsonify({
-        'message': 'OTP berhasil dikirim'
-    }), 200
-
-    # =====================
-    # TESTING LOKAL
-    # =====================
-    print(f"\nOTP untuk {phone}: {otp}\n")
-
-    # =====================
-    # AKTIFKAN JIKA PAKAI FONNTE
-    # =====================
-    """
-    url = "https://api.fonnte.com/send"
-
-    payload = {
-        "target": phone,
-        "message": f"Kode OTP Anda adalah {otp}"
-    }
-
-    headers = {
-        "Authorization": "TOKEN_FONNTE_KAMU"
-    }
-
-    requests.post(
-        url,
-        data=payload,
-        headers=headers
-    )
-    """
-
-    return jsonify({
-        'message': 'OTP berhasil dikirim'
-    })
-
-# =========================
-# VERIFY OTP
-# =========================
-@app.route('/verify-otp', methods=['POST'])
-def verify_otp():
-
-    data = request.get_json()
-
-    phone = data.get('phone')
-    otp = data.get('otp')
-
-    if not phone or not otp:
-        return jsonify({
-            'message': 'Data tidak lengkap'
-        }), 400
-
-    phone = format_phone(phone)
-
-    otp_data = OTP.query.filter_by(
-        phone=phone,
-        otp_code=otp,
-        verified=False
-    ).order_by(
-        OTP.created_at.desc()
-    ).first()
-
-    if not otp_data:
-        return jsonify({
-            'message': 'OTP salah'
-        }), 400
-
-    otp_data.verified = True
-
-    user = User.query.filter_by(
-        owner_phone=phone
-    ).first()
-
-    if not user:
-        return jsonify({
-            'message': 'Nomor belum terdaftar'
-        }), 404
-
-    user.is_verified = True
-
-    db.session.commit()
-
-    token = create_access_token(
-        identity=str(user.id)
-    )
-
-    return jsonify({
-        'message': 'OTP valid',
-        'token': token,
-        'user': {
-            'id': user.id,
-            'owner_name': user.owner_name,
-            'owner_phone': user.owner_phone,
-            'workshop_name': user.workshop_name,
-            'workshop_phone': user.workshop_phone
-        }
-    }), 200
-
-# =========================
-# PROFILE
-# =========================
-
-# =========================
-# DEBUG HEADER
-# =========================
-@app.route('/debug-header', methods=['GET'])
-def debug_header():
-
-    auth_header = request.headers.get(
-        "Authorization"
-    )
-
-    print("\n====================")
-    print("AUTH HEADER")
-    print(auth_header)
-    print("====================\n")
-
-    return jsonify({
-        "authorization": auth_header
-    }), 200
-
-
-# =========================
-# TEST TOKEN
-# =========================
-@app.route('/test-token', methods=['GET'])
-@jwt_required()
-def test_token():
-
-    identity = get_jwt_identity()
-
-    print("\n====================")
-    print("JWT IDENTITY")
-    print(identity)
-    print("====================\n")
-
-    return jsonify({
-        "identity": identity
-    }), 200
-
-@app.route('/profile', methods=['GET'])
-@jwt_required()
-def profile():
-
-    user_id = get_jwt_identity()
-
-    user = User.query.get(
-        int(user_id)
-    )
-
-    if not user:
-        return jsonify({
-            'message': 'User tidak ditemukan'
-        }), 404
 
     return jsonify({
         'user': {
-            'id': user.id,
-            'owner_name': user.owner_name,
-            'owner_phone': user.owner_phone,
-            'workshop_name': user.workshop_name,
-            'workshop_phone': user.workshop_phone
+            'id': account.id,
+            'email': account.email,
+            **profile_data
         }
-})
+    }), 200
 
 # =========================
-# RUN
+# RUN APPLICATION
 # =========================
 if __name__ == '__main__':
-
     with app.app_context():
         db.create_all()
 
