@@ -5,156 +5,127 @@ from flask_sqlalchemy import SQLAlchemy
 from flask_bcrypt import Bcrypt
 from flask_cors import CORS
 
-    app = Flask(__name__)
-CORS(app)
+app = Flask(__name__)
+CORS(app)  # Mengizinkan koneksi dari aplikasi Flutter (HP/Browser)
 
-# =========================
-# CONFIG (Neon Database)
-# =========================
-app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://neondb_owner:npg_6ugBHKE1fiWz@ep-patient-cake-aokqq1ge.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require'
+# ================= CONFIG (Neon Database) =================
+app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://neondb_owner:npg_zS0AWJPD2Hcn@ep-silent-bar-aof30ey6-pooler.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db = SQLAlchemy(app)
 bcrypt = Bcrypt(app)
 
-# =========================
-# MODEL: ACCOUNTS & PROFILES (EMAIL BASED)
-# =========================
-class Account(db.Model):
-    __tablename__ = 'accounts'
+# ================= MODEL DATABASE =================
+class Owner(db.Model):
+    __tablename__ = 'owners'
     id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(150), unique=True, nullable=False)
-    password = db.Column(db.String(255), nullable=False)
-    is_verified = db.Column(db.Boolean, default=True) # Otomatis aktif tanpa OTP
-    
-    # Hubungan One-to-One ke Profile
-    profile = db.relationship('UserProfile', backref='account', uselist=False, cascade="all, delete-orphan")
-
-class UserProfile(db.Model):
-    __tablename__ = 'user_profiles'
-    id = db.Column(db.Integer, primary_key=True)
-    account_id = db.Column(db.Integer, db.ForeignKey('accounts.id'), unique=True, nullable=False)
-    owner_name = db.Column(db.String(100))
-    workshop_name = db.Column(db.String(100))
-    workshop_phone = db.Column(db.String(15))
+    nama_pemilik = db.Column(db.String(100), nullable=False)
+    nomor_hp = db.Column(db.String(20), unique=True, nullable=False)
+    password = db.Column(db.Text, nullable=False)
+    nama_bengkel = db.Column(db.String(100), default='Bandung Jaya')
+    alamat_bengkel = db.Column(db.Text, default='Belum diatur')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
-# =========================
-# ENDPOINT: REGISTER
-# =========================
-@app.route('/register', methods=['POST'])
+# ================= API ENDPOINTS =================
+
+# 1. API REGISTER (TER-UPDATE)
+@app.route('/api/register', methods=['POST'])
 def register():
-    data = request.get_json()
-    email = data.get('email', '').strip().lower()
-    password = data.get('password')
-    
-    owner_name = data.get('owner_name', '')
-    workshop_name = data.get('workshop_name', '')
-    workshop_phone = data.get('workshop_phone', '')
+    try:
+        data = request.get_json()
+        
+        # Validasi input kosong
+        if not data.get('nama_pemilik') or not data.get('nomor_hp') or not data.get('password'):
+            return jsonify({"success": False, "message": "Semua kolom wajib diisi!"}), 400
 
-    if not email or not password:
-        return jsonify({'message': 'Email dan Password wajib diisi'}), 400
+        # Cek apakah nomor HP sudah terdaftar di database Neon
+        user_exists = Owner.query.filter_by(nomor_hp=data['nomor_hp']).first()
+        if user_exists:
+            return jsonify({"success": False, "message": "Nomor HP sudah terdaftar!"}), 400
+            
+        # Enkripsi password sebelum disimpan
+        hashed_password = bcrypt.generate_password_hash(data['password']).decode('utf-8')
+        
+        new_owner = Owner(
+            nama_pemilik=data['nama_pemilik'],
+            nomor_hp=data['nomor_hp'],
+            password=hashed_password
+        )
+        
+        db.session.add(new_owner)
+        db.session.commit()
+        
+        # FIX: Kembalikan payload data user gres untuk Auto-Login di Flutter
+        return jsonify({
+            "success": True, 
+            "message": "Pendaftaran akun pemilik berhasil!",
+            "data": {
+                "nama_pemilik": new_owner.nama_pemilik,
+                "nomor_hp": new_owner.nomor_hp,
+                "nama_bengkel": new_owner.nama_bengkel,
+                "alamat_bengkel": new_owner.alamat_bengkel
+            }
+        }), 201
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    # Cek ketersediaan email
-    existing_account = Account.query.filter_by(email=email).first()
-    if existing_account:
-        return jsonify({'message': 'Email sudah terdaftar'}), 400
-
-    hashed_pw = bcrypt.generate_password_hash(password).decode('utf-8')
-
-    # 1. Simpan ke tabel Akun
-    new_account = Account(email=email, password=hashed_pw, is_verified=True)
-    db.session.add(new_account)
-    db.session.flush()  # Ambil ID account sebelum commit
-
-    # 2. Simpan ke tabel Profil
-    new_profile = UserProfile(
-        account_id=new_account.id,
-        owner_name=owner_name,
-        workshop_name=workshop_name,
-        workshop_phone=workshop_phone if workshop_phone else None
-    )
-    db.session.add(new_profile)
-    db.session.commit()
-
-    return jsonify({
-        'message': 'Registrasi berhasil, akun langsung aktif!',
-        'email': email
-    }), 201
-
-# =========================
-# ENDPOINT: LOGIN (MANUAL EMAIL)
-# =========================
-@app.route('/login', methods=['POST'])
+# 2. API LOGIN
+@app.route('/api/login', methods=['POST'])
 def login():
-    data = request.get_json()
-    email = data.get('email', '').strip().lower()
-    password = data.get('password')
+    try:
+        data = request.get_json()
+        
+        if not data.get('nomor_hp') or not data.get('password'):
+            return jsonify({"success": False, "message": "Nomor HP dan password wajib diisi!"}), 400
 
-    if not email or not password:
-        return jsonify({'message': 'Email dan password tidak boleh kosong'}), 400
+        owner = Owner.query.filter_by(nomor_hp=data['nomor_hp']).first()
+        
+        # Validasi akun dan kecocokan hash password
+        if owner and bcrypt.check_password_hash(owner.password, data['password']):
+            return jsonify({
+                "success": True,
+                "message": "Login berhasil!",
+                "data": {
+                    "nama_pemilik": owner.nama_pemilik,
+                    "nomor_hp": owner.nomor_hp,
+                    "nama_bengkel": owner.nama_bengkel,
+                    "alamat_bengkel": owner.alamat_bengkel
+                }
+            }), 200
+            
+        return jsonify({"success": False, "message": "Nomor HP atau password salah!"}), 400
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    account = Account.query.filter_by(email=email).first()
+# 3. API UPDATE DATA BENGKEL (PROFIL)
+@app.route('/api/profil/bengkel', methods=['PUT'])
+def update_bengkel():
+    try:
+        data = request.get_json()
+        # Mencari berdasarkan nomor_hp yang dikirim dari Flutter
+        owner = Owner.query.filter_by(nomor_hp=data.get('nomor_hp')).first()
+        
+        if not owner:
+            return jsonify({"success": False, "message": "Akun pemilik tidak ditemukan!"}), 404
+            
+        owner.nama_bengkel = data.get('nama_bengkel', owner.nama_bengkel)
+        owner.alamat_bengkel = data.get('alamat_bengkel', owner.alamat_bengkel)
+        
+        db.session.commit()
+        return jsonify({"success": True, "message": "Data bisnis bengkel berhasil diperbarui!"}), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"success": False, "error": str(e)}), 500
 
-    if not account:
-        return jsonify({'message': 'Email tidak ditemukan'}), 404
-
-    if not bcrypt.check_password_hash(account.password, password):
-        return jsonify({'message': 'Password salah'}), 401
-
-    # Mengembalikan data user secara langsung (Bypass JWT token)
-    profile_data = {}
-    if account.profile:
-        profile_data = {
-            'owner_name': account.profile.owner_name,
-            'workshop_name': account.profile.workshop_name,
-            'workshop_phone': account.profile.workshop_phone
-        }
-
-    return jsonify({
-        'message': 'Login berhasil',
-        'user': {
-            'id': account.id,
-            'email': account.email,
-            **profile_data
-        }
-    }), 200
-
-# =========================
-# ENDPOINT: PROFILE (MANUAL BY ID)
-# =========================
-@app.route('/profile/<int:user_id>', methods=['GET'])
-def profile(user_id):
-    account = Account.query.get(user_id)
-
-    if not account:
-        return jsonify({'message': 'User tidak ditemukan'}), 404
-
-    profile_data = {}
-    if account.profile:
-        profile_data = {
-            'owner_name': account.profile.owner_name,
-            'workshop_name': account.profile.workshop_name,
-            'workshop_phone': account.profile.workshop_phone
-        }
-
-    return jsonify({
-        'user': {
-            'id': account.id,
-            'email': account.email,
-            **profile_data
-        }
-    }), 200
-
-# =========================
-# RUN APPLICATION
-# =========================
+# ================= RUN SERVER =================
 if __name__ == '__main__':
+    # Membuat tabel secara otomatis di Neon jika belum ada
     with app.app_context():
         db.create_all()
-
-    app.run(
-        host='0.0.0.0',
-        port=5000,
-        debug=True
-    )
+        
+    # Dijalanankan di host 0.0.0.0 agar bisa diakses HP lewat kabel/Wi-Fi lokal
+    app.run(host='0.0.0.0', port=5000, debug=True)
