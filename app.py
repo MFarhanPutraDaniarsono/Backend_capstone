@@ -13,6 +13,11 @@ CORS(app)
 # ================= CONFIG (Neon Database, Token Fonnte & Path Absolut) =================
 app.config['SQLALCHEMY_DATABASE_URI'] = 'postgresql://neondb_owner:npg_zS0AWJPD2Hcn@ep-silent-bar-aof30ey6-pooler.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require'
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 300,
+    'pool_timeout': 30,
+}
 
 # Token WhatsApp Gateway (Fonnte)
 FONNTE_TOKEN = 'AT6MUTqfshTFbRJeTNMg'
@@ -819,6 +824,10 @@ def add_absensi():
         if 'foto' not in request.files:
             return jsonify({"success": False, "message": "Foto absensi wajib diunggah!"}), 400
             
+        emp = Employee.query.get(int(employee_id))
+        if not emp:
+            return jsonify({"success": False, "message": "Karyawan tidak ditemukan!"}), 404
+            
         file = request.files['foto']
         if file and allowed_file(file.filename):
             ext = file.filename.rsplit('.', 1)[1].lower()
@@ -826,7 +835,8 @@ def add_absensi():
             timestamp = int(time.time())
             filename_unik = f"att_{employee_id}_{timestamp}.{ext}"
             file_path_relative = f"/uploads/absensi_pics/{filename_unik}"
-            file.save(os.path.join(app.config['ABSENSI_UPLOAD_FOLDER'], filename_unik))
+            att_foto_path_abs = os.path.join(app.config['ABSENSI_UPLOAD_FOLDER'], filename_unik)
+            file.save(att_foto_path_abs)
             
             waktu_dt = datetime.fromisoformat(waktu_str) if waktu_str else datetime.utcnow()
             
@@ -842,7 +852,12 @@ def add_absensi():
             db.session.add(new_att)
             db.session.commit()
             
-            return jsonify({"success": True, "message": "Absensi berhasil dicatat!"}), 201
+            return jsonify({
+                "success": True, 
+                "message": "Absensi berhasil dicatat!",
+                "verified": True,
+                "kecocokan": kecocokan
+            }), 201
             
         return jsonify({"success": False, "message": "Format file tidak didukung!"}), 400
     except Exception as e:
@@ -973,6 +988,140 @@ def serve_product_pic(filename):
     return send_from_directory(app.config['PRODUCT_UPLOAD_FOLDER'], filename)
 
 
+@app.route('/api/dashboard/charts', methods=['GET'])
+def get_dashboard_charts():
+    try:
+        import json
+        nomor_hp = request.args.get('nomor_hp')
+        if not nomor_hp:
+            return jsonify({"success": False, "message": "Nomor HP wajib diisi!"}), 400
+            
+        # 1. Fetch 5 Sparepart Termurah dari sparepart_nosql_style
+        top_shopee = []
+        try:
+            res_shopee = db.session.execute(db.text("SELECT dokumen_json FROM sparepart_nosql_style")).fetchall()
+            items_list = []
+            for row in res_shopee:
+                doc = row[0]
+                if isinstance(doc, str):
+                    try:
+                        doc = json.loads(doc)
+                    except:
+                        continue
+                if isinstance(doc, dict):
+                    harga = 0
+                    if 'harga' in doc and doc['harga'] is not None:
+                        try:
+                            harga = int(doc['harga'])
+                        except:
+                            pass
+                    elif 'price' in doc and doc['price'] is not None:
+                        try:
+                            harga = int(doc['price'])
+                        except:
+                            pass
+                    elif 'harga_jual' in doc and doc['harga_jual'] is not None:
+                        try:
+                            harga = int(doc['harga_jual'])
+                        except:
+                            pass
+                            
+                    nama = doc.get('nama_sparepart') or doc.get('nama') or doc.get('name') or 'Item'
+                    
+                    # Format compact (e.g. 15rb)
+                    if harga >= 1000000:
+                        formatted = f"{harga/1000000:.1f}jt".replace('.0', '')
+                    elif harga >= 1000:
+                        formatted = f"{harga/1000:.0f}rb"
+                    else:
+                        formatted = str(harga)
+                        
+                    items_list.append({
+                        "label": nama[:8] + ".." if len(nama) > 8 else nama,
+                        "value": harga,
+                        "formattedValue": formatted
+                    })
+            # Urutkan berdasarkan harga termurah
+            items_list.sort(key=lambda x: x['value'])
+            top_shopee = items_list[:5]
+        except Exception as e:
+            print("Error query sparepart:", e)
+            
+        # 2. Fetch Top 5 Produk Laris   
+             
+        top_produk = []
+        try:
+            sql_prod = """
+                SELECT ti.nama_item, SUM(ti.qty) as total_qty 
+                FROM transaction_items ti 
+                JOIN transactions t ON ti.transaction_id = t.id 
+                WHERE t.nomor_hp_owner = :nomor_hp AND (ti.tipe_item = 'Produk' OR ti.tipe_item = 'Sparepart') 
+                GROUP BY ti.nama_item 
+                ORDER BY total_qty DESC LIMIT 5
+            """
+            res_prod = db.session.execute(db.text(sql_prod), {"nomor_hp": nomor_hp}).fetchall()
+            for row in res_prod:
+                lbl = str(row[0])
+                lbl_short = lbl[:8] + ".." if len(lbl) > 8 else lbl
+                val = int(row[1])
+                top_produk.append({
+                    "label": lbl_short,
+                    "value": val,
+                    "formattedValue": f"{val}x"
+                })
+        except Exception as e:
+            print("Error query top produk:", e)
+            
+        # 3. Tren Pendapatan Harian (5 hari terakhir)
+        revenue_terakhir = []
+        try:
+            sql_rev = """
+                SELECT DATE(created_at) as tgl, SUM(total_tagihan) as revenue 
+                FROM transactions 
+                WHERE nomor_hp_owner = :nomor_hp 
+                GROUP BY DATE(created_at) 
+                ORDER BY tgl DESC LIMIT 5
+            """
+            res_rev = db.session.execute(db.text(sql_rev), {"nomor_hp": nomor_hp}).fetchall()
+            for row in res_rev:
+                tgl_val = row[0]
+                if hasattr(tgl_val, 'strftime'):
+                    tgl_str = tgl_val.strftime('%d %b')
+                else:
+                    from datetime import datetime
+                    dt = datetime.strptime(str(tgl_val), '%Y-%m-%d')
+                    tgl_str = dt.strftime('%d %b')
+                rev = int(row[1])
+                
+                # Format compact (e.g. 15rb)
+                if rev >= 1000000:
+                    formatted = f"{rev/1000000:.1f}jt".replace('.0', '')
+                elif rev >= 1000:
+                    formatted = f"{rev/1000:.0f}rb"
+                else:
+                    formatted = str(rev)
+                    
+                revenue_terakhir.append({
+                    "label": tgl_str,
+                    "value": rev,
+                    "formattedValue": formatted
+                })
+            # Reverse so it's chronologically ordered (left to right)
+            revenue_terakhir.reverse()
+        except Exception as e:
+            print("Error query revenue:", e)
+            
+        return jsonify({
+            "success": True,
+            "top_shopee": top_shopee,
+            "top_produk": top_produk,
+            "revenue_terakhir": revenue_terakhir
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
 if __name__ == '__main__':
     with app.app_context():
         db.create_all() 
@@ -998,4 +1147,4 @@ if __name__ == '__main__':
             db.session.rollback()
             print("Perhatian: Migrasi kolom dilewati:", migration_error)
             
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
